@@ -114,3 +114,27 @@ r <- GET(requestURL, accept("application/json"))
 
 
 ```
+
+```{r}
+##gost query
+
+  # Get gene symbols for this species
+  genes_sp <- protein_data_clean %>%
+    pull(GeneSymbol) %>%
+    unique()
+  
+  # Fetch GO annotations
+  gost_sp <- gost(
+    query = genes_sp,
+    organism = organism_code,
+    sources = c("GO:BP", "GO:MF", "GO:CC")
+  )
+  
+  # Store only the result table with the species column
+  if (!is.null(gost_sp$result)) {
+    go_results_list[[sp]] <- gost_sp$result %>%
+      mutate(Species = sp)
+  }
+
+
+```
