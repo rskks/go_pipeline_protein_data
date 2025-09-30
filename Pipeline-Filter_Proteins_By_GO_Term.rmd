@@ -1,0 +1,116 @@
+---
+title: 'Pipeline: Filter Proteins by GO Term'
+author: "Ronnie Yalung"
+output:
+  html_document: default
+  pdf_document: default
+---
+# Package install. Only need to run once. May take a while
+```{r}
+install.packages("readxl")
+install.packages("dplyr")
+install.packages("tidyr")
+install.packages("ggplot2")
+install.packages("pheatmap")
+install.packages("gprofiler2")
+install.packages("httr")
+install.packages("jsonlite")
+```
+
+# Document set up and library initialization. Run each different time opening the file.
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(readxl)
+library(dplyr)
+library(stringr)
+library(gprofiler2)
+library(httr)
+library(jsonlite)
+library(xml2)
+```
+
+# Read .xlsx file /Users/ronnie.yalung/Documents/work/project1-protein_pipeline/samplestest.xlsx
+```{r}
+print("Note: File format HAS to be in .xlsx, as R can't read the raw .xls Scaffold data. To do this, open the .xls file in 
+      Microsoft Excel, then Save As an Excel Workbook (.xlsx) in the File Format options.")
+
+xlsx_path <- as.character(readline(prompt = "Enter the path to your .xlsx file: "))
+protein_data <- read_excel(path=xlsx_path, skip=3) # skip=3 to omit the description rows
+
+# Remove rows where the # column isa NA
+protein_data <- protein_data[!is.na(protein_data$`#`), ]
+```
+
+# Remove unneccessary columns, normalize the data
+```{r}
+# Find the column number of 'Taxonomy' (Assuming all of the numeric data is after 'Taxonomy' column)
+taxonomy_col <- which(colnames(protein_data) == "Taxonomy")
+
+# All columns after Taxonomy are numeric samples
+sample_cols <- (taxonomy_col + 1):ncol(protein_data)
+
+# Create a new data frame with normalized values
+protein_data_normalized <- protein_data %>%
+  mutate(across(all_of(sample_cols), ~ if_else(. == 0, 0, log2(.)))) # if value = 0, don't "log2 it", as that would result in a disruptive value (-Inf)
+
+protein_data_normalized <- protein_data_normalized %>% dplyr::select(-c(`Molecular Weight`, `Taxonomy`, `Visible?`, `Starred?`,
+                                                                 `Alternate ID`, `Protein Grouping Ambiguity`))
+```
+
+# Clean and update data for GO annotations
+```{r}
+# ----------------------------
+# 2. Clean accession/entry names
+# ----------------------------
+protein_data_clean <- protein_data_normalized %>%
+  mutate(
+    # Remove any " (+1)" or similar scaffold suffix
+    AccessionClean = str_remove(`Accession Number`, "\\s*\\(\\+.*\\)"),
+
+    # Extract UniProtID if present (middle piece)
+    UniProtID = str_extract(AccessionClean, "(?<=\\|)[A-Z0-9]+(?=\\|)"),
+
+    # Extract entry name (right-hand piece)
+    EntryName = str_extract(AccessionClean, "[A-Z0-9_]+(?=\\|?$)"),
+
+    # Create Gene symbol for human/mouse/bovine (strip species suffix)
+    GeneSymbol = str_remove(EntryName, "_[A-Z]+$")
+  ) %>%
+  # Filter out rows with no UniProtID
+  filter(!is.na(UniProtID))
+```
+
+```{r}
+# need to create the API via R or Python, and then call it on the file.
+
+# QUICKGO API:
+# GOterms: the ones we want
+# proteome: empty
+# assignedBy: uniprotID
+#includeFields; goName, name, synonyms
+# selectedFields: empty
+#geneProductID: uniprotid column in db
+# geneProductType: protein
+#genePRoductSubsset: Swiss-Prot
+#goId: the ids we want
+#goUsage: descendants
+#goUsageRelationships: is_a,part_of,occurs_in,regulates //all
+#taxonId: 9606
+#taxonUsage: exact
+#aspect: biological_process,molecular_function,cellular_component
+```
+
+# api
+```{r}
+library(jsonlite)
+
+
+
+```
+
+requestURL <- "https://www.ebi.ac.uk/QuickGO/services/annotation/search"
+r <- GET(requestURL, accept("application/json"))
+
+
+
+```
