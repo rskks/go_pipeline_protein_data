@@ -15,6 +15,8 @@ install.packages("pheatmap")
 install.packages("gprofiler2")
 install.packages("httr")
 install.packages("jsonlite")
+install.packages("ggVennDiagram")
+install.packages("hrbrthemes")
 ```
 
 # Document set up and library initialization. Run each different time opening the file.
@@ -23,10 +25,19 @@ knitr::opts_chunk$set(echo = TRUE)
 library(readxl)
 library(dplyr)
 library(stringr)
-library(gprofiler2)
 library(httr)
 library(jsonlite)
 library(xml2)
+library(purrr)
+library(tibble)
+library(tidyr)
+library(furrr)
+library(future)
+library(progressr)
+library(ggplot2)
+library(ggVennDiagram)
+library(hrbrthemes)
+library(plotly)
 ```
 
 # Read .xlsx file /Users/ronnie.yalung/Documents/work/project1-protein_pipeline/samplestest.xlsx
@@ -37,12 +48,13 @@ print("Note: File format HAS to be in .xlsx, as R can't read the raw .xls Scaffo
 xlsx_path <- as.character(readline(prompt = "Enter the path to your .xlsx file: "))
 protein_data <- read_excel(path=xlsx_path, skip=3) # skip=3 to omit the description rows
 
-# Remove rows where the # column isa NA
+# Remove rows where the # column is a NA
 protein_data <- protein_data[!is.na(protein_data$`#`), ]
-```
 
-# Remove unneccessary columns, normalize the data
-```{r}
+# ------
+# Prep and clean data: remove unneccessary columns, normalize the data. (run once)
+# ------
+  
 # Find the column number of 'Taxonomy' (Assuming all of the numeric data is after 'Taxonomy' column)
 taxonomy_col <- which(colnames(protein_data) == "Taxonomy")
 
@@ -55,86 +67,395 @@ protein_data_normalized <- protein_data %>%
 
 protein_data_normalized <- protein_data_normalized %>% dplyr::select(-c(`Molecular Weight`, `Taxonomy`, `Visible?`, `Starred?`,
                                                                  `Alternate ID`, `Protein Grouping Ambiguity`))
-```
 
-# Clean and update data for GO annotations
-```{r}
-# ----------------------------
-# 2. Clean accession/entry names
-# ----------------------------
-protein_data_clean <- protein_data_normalized %>%
+
+# Clean accession/entry names
+protein_data_normalized <- protein_data_normalized %>%
   mutate(
     # Remove any " (+1)" or similar scaffold suffix
-    AccessionClean = str_remove(`Accession Number`, "\\s*\\(\\+.*\\)"),
+    AccessionNumberClean = str_remove(`Accession Number`, "\\s*\\(\\+.*\\)"),
 
     # Extract UniProtID if present (middle piece)
-    UniProtID = str_extract(AccessionClean, "(?<=\\|)[A-Z0-9]+(?=\\|)"),
+    UniProtID = str_extract(AccessionNumberClean, "(?<=\\|)[A-Z0-9]+(?=\\|)"),
 
     # Extract entry name (right-hand piece)
-    EntryName = str_extract(AccessionClean, "[A-Z0-9_]+(?=\\|?$)"),
+    EntryName = str_extract(AccessionNumberClean, "[A-Z0-9_]+(?=\\|?$)"),
 
-    # Create Gene symbol for human/mouse/bovine (strip species suffix)
+    # Create Gene symbol (strip species suffix)
     GeneSymbol = str_remove(EntryName, "_[A-Z]+$")
   ) %>%
+  # Keep only human proteins
+  filter(str_detect(EntryName, "_HUMAN$")) %>%
   # Filter out rows with no UniProtID
-  filter(!is.na(UniProtID))
+  filter(!is.na(UniProtID)) %>%
+  # Remove unwanted columns
+  select(-`#`, -`Accession Number`)
 ```
 
+
+# FUNCTION FOR GO TERMS. Load into environment (run once)
 ```{r}
-# need to create the API via R or Python, and then call it on the file.
+`%||%` <- function(a, b) if (!is.null(a)) a else b
 
-# QUICKGO API:
-# GOterms: the ones we want
-# proteome: empty
-# assignedBy: uniprotID
-#includeFields; goName, name, synonyms
-# selectedFields: empty
-#geneProductID: uniprotid column in db
-# geneProductType: protein
-#genePRoductSubsset: Swiss-Prot
-#goId: the ids we want
-#goUsage: descendants
-#goUsageRelationships: is_a,part_of,occurs_in,regulates //all
-#taxonId: 9606
-#taxonUsage: exact
-#aspect: biological_process,molecular_function,cellular_component
-```
+# ---------------------------
+# Safe function to fetch GO terms for ONE protein
+# ---------------------------
+fetch_go_for_protein <- function(uniprot_id) {
+  if (missing(uniprot_id) || !nzchar(uniprot_id)) stop("Please provide a valid UniProt ID.")
 
-# api
-```{r}
-library(jsonlite)
+  base_url <- "https://www.ebi.ac.uk/QuickGO/services/annotation/search"
+  all_results <- list()
+  page <- 1L
+  limit <- 200L
 
+  # change API parameters HERE
+  repeat {
+    params <- list(
+      geneProductId = uniprot_id,
+      limit = limit,
+      page = page,
+      includeFields = paste(c("goName","name"), collapse = ",")
+    )
 
+    resp <- tryCatch(
+      GET(base_url, query = params, add_headers(Accept = "application/json"), timeout(60)),
+      error = function(e) stop("Request failed: ", e$message)
+    )
 
-```
+    if (http_error(resp)) {
+      stop(sprintf("QuickGO request failed: %s %s", status_code(resp), content(resp, "text", encoding = "UTF-8")))
+    }
 
-requestURL <- "https://www.ebi.ac.uk/QuickGO/services/annotation/search"
-r <- GET(requestURL, accept("application/json"))
+    parsed <- content(resp, as = "parsed", type = "application/json")
+    results <- parsed$results
 
+    if (is.null(results) || length(results) == 0) break
 
+    # Remove empty items
+    results <- results[map_lgl(results, ~ !is.null(.x) && length(.x) > 0)]
+    if (length(results) > 0) all_results <- append(all_results, results)
 
-```
-
-```{r}
-##gost query
-
-  # Get gene symbols for this species
-  genes_sp <- protein_data_clean %>%
-    pull(GeneSymbol) %>%
-    unique()
-  
-  # Fetch GO annotations
-  gost_sp <- gost(
-    query = genes_sp,
-    organism = organism_code,
-    sources = c("GO:BP", "GO:MF", "GO:CC")
-  )
-  
-  # Store only the result table with the species column
-  if (!is.null(gost_sp$result)) {
-    go_results_list[[sp]] <- gost_sp$result %>%
-      mutate(Species = sp)
+    total <- parsed$pageInfo$total %||% 0
+    per_page <- parsed$pageInfo$resultsPerPage %||% limit
+    if (page * per_page >= total) break
+    page <- page + 1L
   }
 
+  if (length(all_results) == 0) {
+    # No results: return 1-row tibble with empty lists
+    return(tibble(
+      UniProtID = uniprot_id,
+      goIds = list(character(0)),
+      goNames = list(NA_character_),
+      ontology = list(NA_character_),
+    ))
+  }
 
+  # Flatten JSON
+  df <- fromJSON(toJSON(all_results, auto_unbox = TRUE), flatten = TRUE)
+
+  # Ensure all columns exist
+  if (!"goId" %in% names(df)) df$goId <- NA_character_
+  if (!"goName" %in% names(df)) df$goName <- NA_character_
+  if (!"goAspect" %in% names(df)) df$goAspect <- NA_character_
+
+  # Coerce types and process synonyms safely
+  df <- df %>%
+    mutate(
+      goId = as.character(goId),
+      goName = as.character(goName),
+      goAspect = as.character(goAspect),
+    ) %>%
+    select(goId, goName, goAspect) %>%
+    distinct(goId, .keep_all = TRUE)  # Remove duplicate GO IDs
+
+  # Combine results into lists aligned by index
+  goIds <- df$goId
+  goNames <- df$goName
+  ontology <- df$goAspect
+
+  # Return 1-row tibble with list-columns
+  tibble(
+    UniProtID = uniprot_id,
+    goIds = list(goIds),
+    goNames = list(goNames),
+    ontology = list(ontology),
+  )
+}
 ```
+
+# Run the function for each protein in parallel. Protein data with GO:terms that is normalized is in "protein_data_with_go" df
+```{r}
+# Set up parallel plan
+plan(multisession, workers = parallel::detectCores() - 1)
+
+# Function to safely wrap fetch_go_for_protein
+safe_fetch_go <- function(uid) {
+  tryCatch(
+    fetch_go_for_protein(uid),
+    error = function(e) {
+      warning(sprintf("Failed for UniProtID %s: %s", uid, e$message))
+      tibble(
+        UniProtID = uid,
+        goIds = list(character(0)),
+        goNames = list(NA_character_),
+        ontology = list(NA_character_)
+      )
+    }
+  )
+}
+
+# UniProt IDs
+uids <- protein_data_normalized$UniProtID
+
+# Parallel fetch with progress bar
+results_list <- future_map(uids, safe_fetch_go, .progress = TRUE)
+
+# Combine results into a single data frame
+go_annotations_df <- bind_rows(results_list)
+
+# Merge back to original dataset safely
+protein_data_with_go <- bind_cols(
+  protein_data_normalized,
+  go_annotations_df %>% select(-UniProtID)
+)
+
+# Inspect
+#print(head(protein_data_with_go))
+```
+
+# Functions for filtering by GO ID and GO Term (strict, non-strict) and combined methods. Load once
+```{r}
+# -------------------------------
+# GO ID filter
+# -------------------------------
+filter_proteins_by_go <- function(protein_df) {
+  user_input <- readline(prompt = "Enter GO IDs to filter for (comma-separated, e.g., GO:0003677,GO:0008150): ")
+  go_terms <- str_trim(unlist(str_split(user_input, ",")))
+  if (length(go_terms) == 0) stop("No valid GO IDs entered.")
+  
+  n <- nrow(protein_df)
+  pb <- txtProgressBar(min = 0, max = n, style = 3)
+  
+  filtered_flags <- map_lgl(seq_len(n), function(i) {
+    setTxtProgressBar(pb, i)
+    ids <- protein_df$goIds[[i]]
+    if (is.null(ids) || length(ids) == 0) return(FALSE)
+    any(ids %in% go_terms)
+  })
+  
+  close(pb)
+  filtered_df <- protein_df[filtered_flags, ]
+  message(sprintf("Filtered %d proteins out of %d total.", nrow(filtered_df), nrow(protein_df)))
+  return(filtered_df)
+}
+
+# -------------------------------
+# GO name filter (contains/fuzzy)
+# -------------------------------
+filter_proteins_by_go_names <- function(protein_df) {
+  user_input <- readline(prompt = "Enter GO term keywords to filter for (comma-separated, e.g., RNA binding, apoptosis): ")
+  go_keywords <- str_trim(unlist(str_split(user_input, ",")))
+  if (length(go_keywords) == 0) stop("No valid GO keywords entered.")
+  
+  n <- nrow(protein_df)
+  pb <- txtProgressBar(min = 0, max = n, style = 3)
+  
+  filtered_flags <- map_lgl(seq_len(n), function(i) {
+    setTxtProgressBar(pb, i)
+    names <- protein_df$goNames[[i]]
+    if (is.null(names) || length(names) == 0) return(FALSE)
+    any(sapply(names, function(nm) any(str_detect(nm, regex(go_keywords, ignore_case = TRUE)))))
+  })
+  
+  close(pb)
+  filtered_df <- protein_df[filtered_flags, ]
+  message(sprintf("Filtered %d proteins out of %d total.", nrow(filtered_df), nrow(protein_df)))
+  return(filtered_df)
+}
+
+# -------------------------------
+# Strict GO name filter (exact match)
+# -------------------------------
+filter_proteins_by_go_names_strict <- function(protein_df) {
+  user_input <- readline(prompt = "Enter exact GO term names to filter for (comma-separated): ")
+  go_exact <- str_trim(unlist(str_split(user_input, ",")))
+  if (length(go_exact) == 0) stop("No valid GO keywords entered.")
+  
+  n <- nrow(protein_df)
+  pb <- txtProgressBar(min = 0, max = n, style = 3)
+  
+  filtered_flags <- map_lgl(seq_len(n), function(i) {
+    setTxtProgressBar(pb, i)
+    names <- protein_df$goNames[[i]]
+    if (is.null(names) || length(names) == 0) return(FALSE)
+    any(names == go_exact) # changed from %in%
+  })
+  
+  close(pb)
+  filtered_df <- protein_df[filtered_flags, ]
+  message(sprintf("Filtered %d proteins out of %d total.", nrow(filtered_df), nrow(protein_df)))
+  return(filtered_df)
+}
+
+# -------------------------------
+# Combined GO ID + GO name filter (non-strict / contains)
+# -------------------------------
+filter_proteins_by_go_combined <- function(protein_df) {
+  user_go_ids <- readline(prompt = "Enter GO IDs to filter for (comma-separated, or leave blank to skip): ")
+  go_ids <- if (nzchar(user_go_ids)) str_trim(unlist(str_split(user_go_ids, ","))) else character(0)
+  
+  user_go_names <- readline(prompt = "Enter GO term keywords to filter for (comma-separated, or leave blank to skip): ")
+  go_names <- if (nzchar(user_go_names)) str_trim(unlist(str_split(user_go_names, ","))) else character(0)
+  
+  if (length(go_ids) == 0 && length(go_names) == 0) stop("No GO IDs or GO names entered.")
+  
+  n <- nrow(protein_df)
+  pb <- txtProgressBar(min = 0, max = n, style = 3)
+  
+  filtered_flags <- map_lgl(seq_len(n), function(i) {
+    setTxtProgressBar(pb, i)
+    
+    ids <- protein_df$goIds[[i]]
+    names <- protein_df$goNames[[i]]
+    
+    match_id <- length(go_ids) > 0 && !is.null(ids) && any(ids %in% go_ids)
+    match_name <- length(go_names) > 0 && !is.null(names) &&
+                  any(sapply(names, function(nm) any(str_detect(nm, regex(go_names, ignore_case = TRUE)))))
+    
+    return(match_id || match_name) # OR function
+  })
+  
+  close(pb)
+  filtered_df <- protein_df[filtered_flags, ]
+  message(sprintf("Filtered %d proteins out of %d total.", nrow(filtered_df), nrow(protein_df)))
+  return(filtered_df)
+}
+
+# -------------------------------
+# Combined GO ID + GO name filter (strict / exact)
+# -------------------------------
+filter_proteins_by_go_combined_strict <- function(protein_df) {
+  user_go_ids <- readline(prompt = "Enter GO IDs to filter for (comma-separated, or leave blank to skip): ")
+  go_ids <- if (nzchar(user_go_ids)) str_trim(unlist(str_split(user_go_ids, ","))) else character(0)
+  
+  user_go_names <- readline(prompt = "Enter exact GO term names to filter for (comma-separated, or leave blank to skip): ")
+  go_names <- if (nzchar(user_go_names)) str_trim(unlist(str_split(user_go_names, ","))) else character(0)
+  
+  if (length(go_ids) == 0 && length(go_names) == 0) stop("No GO IDs or GO names entered.")
+  
+  n <- nrow(protein_df)
+  pb <- txtProgressBar(min = 0, max = n, style = 3)
+  
+  filtered_flags <- map_lgl(seq_len(n), function(i) {
+    setTxtProgressBar(pb, i)
+    
+    ids <- protein_df$goIds[[i]]
+    names <- protein_df$goNames[[i]]
+    
+    match_id <- length(go_ids) > 0 && !is.null(ids) && any(ids %in% go_ids)
+    match_name <- length(go_names) > 0 && !is.null(names) && any(names == go_names) # changed from %in%
+    
+    return(match_id || match_name) # OR function
+  })
+  
+  close(pb)
+  filtered_df <- protein_df[filtered_flags, ]
+  message(sprintf("Filtered %d proteins out of %d total.", nrow(filtered_df), nrow(protein_df)))
+  return(filtered_df)
+}
+```
+
+# Function for running/choosing between the filters (load/run once)
+```{r}
+# -------------------------------
+# Wrapper: choose GO filter interactively
+# -------------------------------
+run_go_filter <- function(protein_df) {
+  
+  # List of functions with descriptions
+  filters <- list(
+    list(name = "filter_proteins_by_go", 
+         desc = "Filter by GO IDs"),
+    list(name = "filter_proteins_by_go_names", 
+         desc = "Filter by GO names (contains/fuzzy)"),
+    list(name = "filter_proteins_by_go_names_strict", 
+         desc = "Filter by GO names (exact match)"),
+    list(name = "filter_proteins_by_go_combined", 
+         desc = "Filter by GO IDs and GO names (contains/fuzzy)"),
+    list(name = "filter_proteins_by_go_combined_strict", 
+         desc = "Filter by GO IDs and GO names (exact match)")
+  )
+  
+  # Print numbered list
+  cat("Choose a GO filter function to run:\n")
+  for (i in seq_along(filters)) {
+    cat(sprintf("%d: %s - %s\n", i, filters[[i]]$name, filters[[i]]$desc))
+  }
+  
+  # Prompt user for selection
+  selection <- readline(prompt = "Enter the number of the function to run: ")
+  
+  # Validate input
+  if (!grepl("^[1-5]$", selection)) {
+    stop("Invalid selection. Please enter a number from 1 to 5.")
+  }
+  
+  selection <- as.integer(selection)
+  func_name <- filters[[selection]]$name
+  
+  # Confirm
+  cat(sprintf("Running function: %s\n", func_name))
+  
+  # Call the selected function dynamically
+  result <- do.call(func_name, list(protein_df))
+  
+  return(result)
+}
+
+# -------------------------------
+# Example usage:
+# filtered_proteins <- run_go_filter(protein_data_with_go)
+```
+
+# Run function.
+```{r}
+filtered_proteins <- run_go_filter(protein_data_with_go)
+filtered_proteins2 <- run_go_filter(protein_data_with_go)
+```
+
+
+# Data Analysis (Heatmap, PCA)
+```{r}
+# GGVenn
+
+#venn <- ggVennDiagram(filtered_proteins[2:11], force_upset = TRUE, label_color='white')
+dfTEST <- filtered_proteins %>% dplyr::select(-c(`Identified Proteins (2366)`, `AccessionNumberClean`, `UniProtID`,
+                                                                 `EntryName`, `goIds`, `goNames`, `ontology`, `GeneSymbol`))
+# TODO: make data anlysis more universla (i.e. col name filtering)
+row.names(dfTEST) <- filtered_proteins$GeneSymbol
+
+# 3. Convert to long format
+df_long <- dfTEST %>%
+  mutate(Gene = rownames(dfTEST)) %>%
+  pivot_longer(
+    cols = -Gene,
+    names_to = "Sample",
+    values_to = "Value"
+  )
+
+# 4. Create tooltip text column
+df_long <- df_long %>%
+  mutate(text = paste0("Gene: ", Gene, "\nSample: ", Sample, "\nValue: ", round(Value, 3)))
+
+# 5. Plot
+p <- ggplot(df_long, aes(x = Sample, y = Gene, fill = Value, text = text)) +
+  geom_tile() +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+# 6. Make it interactive
+ggplotly(p, tooltip = "text")
+```
+# TODO: clustering, change 0 color for contrast, universal filtering, (size) changes for readability, top (n) protein expression function (for EACH column (HCF, HNPCC, etc)), ggVennDiagram user prompt to choose which samples/columns(HCF, HNPCC) to view, PCA user prompt.
+# user prompt to get what type of data they want.
