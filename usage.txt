@@ -89,6 +89,18 @@ GROUP 2: NUMERIC DATA FILTERING
      # Keep only specific genes and samples
      filtered <- filter_numeric_protein_data(df_numeric, gene_symbols=c("KRT1","TP53"), protein_samples=c("HNPCC_CL","HCF_EV"))
 
+     # Keep genes TP53, BRCA1, MYC
+     # Only columns Sample1, Sample2
+     # Expression ≥ 1 in any column
+     # Then top 5 genes by mean
+     filtered <- filter_numeric_protein_data(
+       data = protein_data,
+       gene_symbols = c("TP53", "BRCA1", "MYC"),
+       protein_samples = c("Sample1", "Sample2"),
+       expression_threshold = c(">=", 1),
+       top_n_genes = 5
+     )
+
 ------------------------------------------------------------
 GROUP 3: DATA VISUALIZATION FUNCTIONS
 ------------------------------------------------------------
